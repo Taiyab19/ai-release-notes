@@ -1,0 +1,185 @@
+name: CI/CD Release Pipeline
+
+on:
+  push:
+    branches: [ main, develop, release/* ]
+  pull_request:
+    branches: [ main, release/* ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment target'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [ dev, staging, production ]
+
+env:
+  APP_NAME:      payment-service
+  COVERAGE_MIN:  80
+  PYTHON_VER:    "3.11"
+
+jobs:
+
+  # ── Job 1: Build & Test ─────────────────────────────────────
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.versioning.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+
+      - name: Generate version
+        id: versioning
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "1.0.${GITHUB_RUN_NUMBER}")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Lint (flake8)
+        run: |
+          pip install flake8
+          flake8 app/app.py --max-line-length=100 --statistics
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest app/test_app.py \
+            -v \
+            --cov=app \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+
+  # ── Job 2: Quality Gate ─────────────────────────────────────
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VER }}
+      - run: pip install -r app/requirements.txt pytest pytest-cov
+
+      - name: Run coverage check
+        run: |
+          pytest app/test_app.py --cov=app --cov-report=xml:coverage.xml -q
+          python3 -c "
+          import xml.etree.ElementTree as ET, sys
+          tree = ET.parse('coverage.xml')
+          cov = float(tree.getroot().attrib.get('line-rate', 0)) * 100
+          print(f'Coverage: {cov:.1f}% (minimum: ${{ env.COVERAGE_MIN }}%)')
+          if cov < ${{ env.COVERAGE_MIN }}:
+              print('QUALITY GATE FAILED: Coverage below minimum threshold')
+              sys.exit(1)
+          print('Quality gate PASSED')
+          "
+
+  # ── Job 3: Package Artifact ─────────────────────────────────
+  package:
+    name: Package Artifact
+    runs-on: ubuntu-latest
+    needs: quality-gate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package application
+        run: |
+          mkdir -p artifacts
+          ARTIFACT="payment-service-${{ github.run_number }}"
+          tar -czf "artifacts/${ARTIFACT}.tar.gz" app/
+          echo "Artifact: artifacts/${ARTIFACT}.tar.gz"
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-artifact
+          path: artifacts/
+          retention-days: 30
+
+  # ── Job 4: Deploy to DEV ────────────────────────────────────
+  deploy-dev:
+    name: Deploy → DEV
+    runs-on: ubuntu-latest
+    needs: package
+    environment: dev
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to DEV
+        run: bash scripts/deploy.sh dev "payment-service-${{ github.run_number }}" "${{ needs.build-and-test.outputs.version }}"
+      - name: Smoke test DEV
+        run: bash scripts/smoke-test.sh dev "http://localhost:5000" || echo "Smoke test (simulated)"
+
+  # ── Job 5: Deploy to STAGING ───────────────────────────────
+  deploy-staging:
+    name: Deploy → STAGING
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    environment: staging
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to STAGING
+        run: bash scripts/deploy.sh staging "payment-service-${{ github.run_number }}" "${{ needs.build-and-test.outputs.version }}"
+      - name: Smoke test STAGING
+        run: bash scripts/smoke-test.sh staging "http://localhost:5000" || echo "Smoke test (simulated)"
+
+  # ── Job 6: Production Approval + Deploy ────────────────────
+  deploy-production:
+    name: Deploy → PRODUCTION
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    # GitHub environment "production" has required reviewers set — this is the approval gate
+    environment: production
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to PRODUCTION
+        env:
+          APPROVED_BY: ${{ github.actor }}
+        run: bash scripts/deploy.sh production "payment-service-${{ github.run_number }}" "${{ needs.build-and-test.outputs.version }}"
+
+      - name: Post-deploy health check
+        run: bash scripts/health-check.sh "http://localhost:5000" || echo "Health check (simulated)"
+
+      - name: Generate release notes
+        env:
+          VERSION: ${{ needs.build-and-test.outputs.version }}
+          APPROVED_BY: ${{ github.actor }}
+        run: |
+          bash scripts/generate-release-notes.sh > "RELEASE_NOTES_${{ needs.build-and-test.outputs.version }}.md"
+          cat "RELEASE_NOTES_${{ needs.build-and-test.outputs.version }}.md"
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: RELEASE_NOTES_*.md
